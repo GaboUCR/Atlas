@@ -8,6 +8,9 @@ import api.security as sec
 from api.security import RateLimiter 
 from core.tenancy import TenantRegistry
 
+from core.ingest_service import IngestDoc as IngestDocModel, ingest_texts
+from core.retrieval import rag_answer
+
 load_dotenv()
 
 app = FastAPI(title="Atlas API — MS2 Multi-tenant", version="0.2.0")
@@ -52,10 +55,12 @@ class AskResponse(BaseModel):
 def health():
     return {"status": "ok", "tenants": len(sec.REGISTRY._tenants) if sec.REGISTRY else 0}
 
+
 @app.post("/tenants", response_model=CreateTenantResponse, tags=["Tenants"], dependencies=[Depends(sec.admin_auth)])
 def create_tenant(req: CreateTenantRequest):
     api_key = sec.REGISTRY.create_tenant(tenant_id=req.tenant_id, name=req.name)
     return {"tenant_id": req.tenant_id, "api_key": api_key}
+
 
 @app.post("/tenants/{tenant_id}/docs", tags=["Documents"], dependencies=[Depends(sec.rate_limit)])
 def ingest_docs(
@@ -65,9 +70,21 @@ def ingest_docs(
 ):
     if tenant_id != auth_tenant_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tenant mismatch")
-    # TODO MS2.5: conectar con VectorStoreFactory → chunking/embeddings/upsert por tenant
-    count = len(req.documents)
-    return {"tenant_id": tenant_id, "ingested": count, "status": "accepted", "note": "stub - falta indexado"}
+
+    # mapear a modelo interno
+    docs_internal = [
+        IngestDocModel(text=d.text, source=d.source or "payload", metadata=d.metadata or {})
+        for d in req.documents
+    ]
+
+    # parámetros de chunking desde env (con defaults)
+    import os
+    chunk_size = int(os.getenv("CHUNK_SIZE", "1200"))
+    chunk_overlap = int(os.getenv("CHUNK_OVERLAP", "200"))
+
+    res = ingest_texts(tenant_id, docs_internal, chunk_size=chunk_size, overlap=chunk_overlap)
+    return res.model_dump()
+
 
 @app.post("/tenants/{tenant_id}/ask", response_model=AskResponse, tags=["Chat"], dependencies=[Depends(sec.rate_limit)])
 def ask(
@@ -77,12 +94,10 @@ def ask(
 ):
     if tenant_id != auth_tenant_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tenant mismatch")
-    # TODO MS2.5: usar retriever per-tenant; por ahora stub
-    return AskResponse(
-        answer="[stub] Motor de retrieval aún no conectado para este tenant.",
-        citations=[],
-        metrics={"note": "ms2 stubs"},
-    )
+
+    result = rag_answer(tenant_id, req.query, req.top_k)
+    return AskResponse(**result)
+
 
 @app.get("/tenants/{tenant_id}/metrics", tags=["Metrics"], dependencies=[Depends(sec.rate_limit)])
 def metrics(
