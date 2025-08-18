@@ -10,6 +10,9 @@ from core.chunking import normalize_text, split_into_chunks
 from core.vectorstore_factory import get_vectorstore
 from core.raw_store import save_raw
 
+from observability.metrics import INGESTED_CHUNKS_TOTAL, DUPLICATES_TOTAL
+
+
 class IngestDoc(BaseModel):
     text: str
     source: str | None = None
@@ -114,6 +117,11 @@ def ingest_texts(tenant_id: str, docs: List[IngestDoc], *, chunk_size: int = 120
                 except Exception:
                     duplicates += 1
                     continue
+
+    if ingested:
+        INGESTED_CHUNKS_TOTAL.labels(tenant_id=tenant_id).inc(ingested)
+    if duplicates:
+        DUPLICATES_TOTAL.labels(tenant_id=tenant_id).inc(duplicates)
 
     took_ms = int((time.perf_counter() - t0) * 1000)
     return IngestResult(
