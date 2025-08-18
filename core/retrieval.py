@@ -83,6 +83,7 @@ def rag_answer(tenant_id: str, query: str, k: int) -> Dict[str, Any]:
             "score": float(score) if score is not None else None,
             "snippet": doc.page_content[:220] + ("..." if len(doc.page_content) > 220 else ""),
             "chunk_id": meta.get("id") or meta.get("_id"),
+            "doc_id": meta.get("doc_id"),
         })
 
     took_ms = int((time.perf_counter() - t0) * 1000)

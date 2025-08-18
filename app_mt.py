@@ -1,6 +1,6 @@
 import os
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, Depends, HTTPException, status, Path
+from fastapi import FastAPI, Depends, HTTPException, status, Path, Query
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -9,6 +9,7 @@ from api.security import RateLimiter
 from core.tenancy import TenantRegistry
 
 from core.ingest_service import IngestDoc as IngestDocModel, ingest_texts
+from core.raw_store import list_raw, get_raw
 from core.retrieval import rag_answer
 
 load_dotenv()
@@ -37,6 +38,19 @@ class IngestDoc(BaseModel):
     text: str = Field(..., min_length=1, max_length=200_000)
     source: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+    doc_id: Optional[str] = None
+    force_reindex: bool = False
+
+class IngestDocsResponse(BaseModel):
+    tenant_id: str
+    ingested: int
+    duplicates_skipped: int
+    errors: int
+    chunks_total: int
+    raw_saved: int
+    raw_bytes: int
+    doc_ids: List[str]
+    metrics: Dict[str, Any]
 
 class IngestDocsRequest(BaseModel):
     documents: List[IngestDoc]
@@ -50,6 +64,10 @@ class AskResponse(BaseModel):
     citations: List[Dict[str, Any]] = []
     metrics: Dict[str, Any] = {}
 
+class ListDocsResponse(BaseModel):
+    items: List[Dict[str, Any]]
+    next_cursor: Optional[str] = None
+
 # --- Rutas ---
 @app.get("/health")
 def health():
@@ -61,8 +79,7 @@ def create_tenant(req: CreateTenantRequest):
     api_key = sec.REGISTRY.create_tenant(tenant_id=req.tenant_id, name=req.name)
     return {"tenant_id": req.tenant_id, "api_key": api_key}
 
-
-@app.post("/tenants/{tenant_id}/docs", tags=["Documents"], dependencies=[Depends(sec.rate_limit)])
+@app.post("/tenants/{tenant_id}/docs", response_model=IngestDocsResponse, tags=["Documents"], dependencies=[Depends(sec.rate_limit)])
 def ingest_docs(
     tenant_id: str = Path(..., description="Tenant destino"),
     auth_tenant_id: str = Depends(sec.resolve_tenant_id),
@@ -71,19 +88,54 @@ def ingest_docs(
     if tenant_id != auth_tenant_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tenant mismatch")
 
-    # mapear a modelo interno
     docs_internal = [
-        IngestDocModel(text=d.text, source=d.source or "payload", metadata=d.metadata or {})
+        IngestDocModel(
+            text=d.text,
+            source=d.source or "payload",
+            metadata=d.metadata or {},
+            doc_id=d.doc_id,
+            force_reindex=d.force_reindex,
+        )
         for d in req.documents
     ]
 
-    # parámetros de chunking desde env (con defaults)
     import os
     chunk_size = int(os.getenv("CHUNK_SIZE", "1200"))
     chunk_overlap = int(os.getenv("CHUNK_OVERLAP", "200"))
 
     res = ingest_texts(tenant_id, docs_internal, chunk_size=chunk_size, overlap=chunk_overlap)
     return res.model_dump()
+
+
+@app.get("/tenants/{tenant_id}/docs", response_model=ListDocsResponse, tags=["Documents"], dependencies=[Depends(sec.rate_limit)])
+def list_docs_endpoint(
+    tenant_id: str = Path(...),
+    auth_tenant_id: str = Depends(sec.resolve_tenant_id),
+    limit: int = Query(50, ge=1, le=200),
+    cursor: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),
+):
+    if tenant_id != auth_tenant_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tenant mismatch")
+    items, next_cursor = list_raw(tenant_id, limit=limit, cursor=cursor, source=source)
+    return {"items": items, "next_cursor": next_cursor}
+
+
+# --- GET /docs/{doc_id} (lectura raw/clean) ---
+@app.get("/tenants/{tenant_id}/docs/{doc_id}", tags=["Documents"], dependencies=[Depends(sec.rate_limit)])
+def get_doc_endpoint(
+    tenant_id: str = Path(...),
+    doc_id: str = Path(...),
+    auth_tenant_id: str = Depends(sec.resolve_tenant_id),
+    variant: str = Query("raw", pattern=r"^(raw|clean)$"),
+):
+    if tenant_id != auth_tenant_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tenant mismatch")
+    try:
+        rec = get_raw(tenant_id, doc_id, variant=variant)
+        return rec
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @app.post("/tenants/{tenant_id}/ask", response_model=AskResponse, tags=["Chat"], dependencies=[Depends(sec.rate_limit)])
@@ -98,7 +150,7 @@ def ask(
     result = rag_answer(tenant_id, req.query, req.top_k)
     return AskResponse(**result)
 
-
+ 
 @app.get("/tenants/{tenant_id}/metrics", tags=["Metrics"], dependencies=[Depends(sec.rate_limit)])
 def metrics(
     tenant_id: str = Path(...),
